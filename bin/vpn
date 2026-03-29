@@ -2,8 +2,6 @@
 # vpn - OpenConnect VPN connection manager
 # Automatic DNS healing, route cleanup, and reconnection support
 
-set -uo pipefail
-
 # --- Configuration ---
 CONFIG_FILE="${VPN_CONFIG:-$HOME/.config/vpn/config.sh}"
 
@@ -184,16 +182,14 @@ vpn_connect() {
     cleanup_routes
 
     log_info "连接 VPN..."
-    local oc_args=(
-        --protocol=anyconnect
-        --user="$VPN_USER"
-        --authgroup="$VPN_GROUP"
-        --force-dpd="${VPN_DPD_TIMEOUT:-30}"
-        --reconnect-timeout="${VPN_RECONNECT_TIMEOUT:-600}"
-    )
-    [[ "${VPN_NO_DTLS:-true}" == "true" ]] && oc_args+=(--no-dtls)
-
-    sudo openconnect "${oc_args[@]}" "$VPN_HOST"
+    sudo openconnect \
+        --protocol=anyconnect \
+        --user="$VPN_USER" \
+        --authgroup="$VPN_GROUP" \
+        ${VPN_NO_DTLS:+--no-dtls} \
+        --force-dpd="${VPN_DPD_TIMEOUT:-30}" \
+        --reconnect-timeout="${VPN_RECONNECT_TIMEOUT:-600}" \
+        "$VPN_HOST"
 }
 
 # 主逻辑
