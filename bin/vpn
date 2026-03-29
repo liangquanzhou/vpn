@@ -1,0 +1,221 @@
+#!/bin/bash
+# vpn - OpenConnect VPN connection manager
+# Automatic DNS healing, route cleanup, and reconnection support
+
+set -uo pipefail
+
+# --- Configuration ---
+CONFIG_FILE="${VPN_CONFIG:-$HOME/.config/vpn/config.sh}"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "VPN config not found: $CONFIG_FILE"
+    echo "Create it from the example: cp config.example.sh ~/.config/vpn/config.sh"
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+# Validate required settings
+for var in VPN_HOST VPN_USER VPN_GROUP; do
+    if [[ -z "${!var:-}" ]]; then
+        echo "Required config missing: $var in $CONFIG_FILE"
+        exit 1
+    fi
+done
+
+# Build endpoint list for route cleanup
+VPN_DOMAINS=("$VPN_HOST")
+if [[ -n "${VPN_ENDPOINT_PREFIX:-}" && -n "${VPN_ENDPOINT_SUFFIX:-}" ]]; then
+    for i in $(seq ${VPN_ENDPOINT_RANGE_START:-1} ${VPN_ENDPOINT_RANGE_END:-10}); do
+        VPN_DOMAINS+=("${VPN_ENDPOINT_PREFIX}${i}${VPN_ENDPOINT_SUFFIX}")
+    done
+fi
+
+# 颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# 带超时的 DNS 解析（替代 dscacheutil，避免无限阻塞）
+resolve_host() {
+    dig +short +time=2 +tries=1 "$1" 2>/dev/null | grep -E '^[0-9.]+'
+}
+
+# 获取当前活跃的网络服务名（Wi-Fi / USB LAN 等）
+get_active_service() {
+    while IFS= read -r svc; do
+        [[ "$svc" == \** ]] && continue
+        local ip
+        ip=$(networksetup -getinfo "$svc" 2>/dev/null | awk -F': ' '/^IP address:/{print $2}')
+        if [[ -n "$ip" && "$ip" != "none" ]]; then
+            echo "$svc"
+            return 0
+        fi
+    done < <(networksetup -listallnetworkservices)
+    return 1
+}
+
+# 确保 DNS 能解析 VPN 域名（自动修复）
+ensure_dns() {
+    # 已经能解析，直接返回
+    if resolve_host "$VPN_HOST" | head -1 | grep -qE '^[0-9.]+'; then
+        return 0
+    fi
+
+    log_warn "DNS 无法解析 $VPN_HOST，自动修复中..."
+
+    local service
+    service=$(get_active_service)
+    if [ -z "$service" ]; then
+        log_error "未找到活跃的网络接口"
+        return 1
+    fi
+
+    # 第一步：恢复 DHCP 自动 DNS
+    log_info "恢复 DHCP DNS（接口: $service）..."
+    sudo networksetup -setdnsservers "$service" empty
+    sudo dscacheutil -flushcache 2>/dev/null
+    sudo killall -HUP mDNSResponder 2>/dev/null
+    sleep 1
+
+    if resolve_host "$VPN_HOST" | head -1 | grep -qE '^[0-9.]+'; then
+        log_info "DNS 已修复（DHCP 自动获取）"
+        return 0
+    fi
+
+    # 第二步：DHCP DNS 也不行，用公共 DNS 兜底
+    log_warn "DHCP DNS 也无法解析，切换到公共 DNS..."
+    sudo networksetup -setdnsservers "$service" 8.8.8.8 114.114.114.114
+    sudo dscacheutil -flushcache 2>/dev/null
+    sudo killall -HUP mDNSResponder 2>/dev/null
+    sleep 1
+
+    if resolve_host "$VPN_HOST" | head -1 | grep -qE '^[0-9.]+'; then
+        log_info "DNS 已修复（公共 DNS）"
+        return 0
+    fi
+
+    log_error "DNS 仍无法解析 $VPN_HOST，请检查网络连接"
+    return 1
+}
+
+# 清理残留路由（VPN IP 走旧网关的情况）
+cleanup_routes() {
+    local default_gw
+    default_gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+    [ -z "$default_gw" ] && return
+
+    # 收集所有 VPN 相关 IP（使用 dig 带超时，不会卡死）
+    local ips
+    ips=$(
+        {
+            for host in "${VPN_DOMAINS[@]}"; do
+                resolve_host "$host"
+            done
+            if [[ -n "${VPN_ROUTE_PATTERN:-}" ]]; then
+                netstat -rn | awk "/${VPN_ROUTE_PATTERN}/{print \$1}"
+            fi
+        } | grep -E '^[0-9.]+$' | sort -u
+    )
+
+    [ -z "$ips" ] && return
+
+    # 3) 逐个检查并清理残留
+    local route_gw cleaned=0
+    while read -r ip; do
+        [ -z "$ip" ] && continue
+        route_gw=$(route -n get "$ip" 2>/dev/null | awk '/gateway:/{print $2}')
+        if [ -n "$route_gw" ] && [ "$route_gw" != "$default_gw" ]; then
+            sudo route -n delete "$ip" >/dev/null 2>&1
+            log_info "已清理残留路由: $ip -> $route_gw (当前默认网关 $default_gw)"
+            ((cleaned++))
+        fi
+    done <<< "$ips"
+
+    [ $cleaned -eq 0 ] || log_info "共清理 $cleaned 条残留路由"
+}
+
+# 检查 VPN 状态
+vpn_status() {
+    if pgrep -x openconnect > /dev/null; then
+        log_info "VPN 正在运行"
+        ifconfig | grep -A 5 "utun" | grep "inet " | head -1 | awk '{print "VPN IP: "$2}'
+        return 0
+    else
+        log_warn "VPN 未运行"
+        return 1
+    fi
+}
+
+# 断开 VPN
+vpn_disconnect() {
+    if pgrep -x openconnect > /dev/null; then
+        log_info "断开 VPN..."
+        sudo killall openconnect 2>/dev/null
+        sleep 1
+        log_info "VPN 已断开"
+    else
+        log_warn "VPN 未在运行"
+    fi
+    cleanup_routes
+}
+
+# 连接 VPN（手动输入密码）
+vpn_connect() {
+    if pgrep -x openconnect > /dev/null; then
+        log_warn "VPN 已经在运行"
+        vpn_status
+        return 0
+    fi
+
+    if ! command -v openconnect >/dev/null 2>&1; then
+        log_error "未找到 openconnect，请先安装：brew install openconnect"
+        return 1
+    fi
+
+    # 自动检测并修复 DNS
+    ensure_dns || return 1
+
+    cleanup_routes
+
+    log_info "连接 VPN..."
+    local oc_args=(
+        --protocol=anyconnect
+        --user="$VPN_USER"
+        --authgroup="$VPN_GROUP"
+        --force-dpd="${VPN_DPD_TIMEOUT:-30}"
+        --reconnect-timeout="${VPN_RECONNECT_TIMEOUT:-600}"
+    )
+    [[ "${VPN_NO_DTLS:-true}" == "true" ]] && oc_args+=(--no-dtls)
+
+    sudo openconnect "${oc_args[@]}" "$VPN_HOST"
+}
+
+# 主逻辑
+case "${1:-connect}" in
+    connect|c)
+        vpn_connect
+        ;;
+    disconnect|d|stop)
+        vpn_disconnect
+        ;;
+    status|s)
+        vpn_status
+        ;;
+    clean|fix)
+        log_info "清理 VPN 残留路由..."
+        cleanup_routes
+        ;;
+    *)
+        echo "用法: vpn [connect|disconnect|status|clean]"
+        echo "  connect (c)    - 连接 VPN"
+        echo "  disconnect (d) - 断开 VPN"
+        echo "  status (s)     - 查看状态"
+        echo "  clean (fix)    - 清理残留路由"
+        ;;
+esac
