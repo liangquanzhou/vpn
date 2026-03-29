@@ -182,14 +182,31 @@ vpn_connect() {
     cleanup_routes
 
     log_info "连接 VPN..."
-    sudo openconnect \
-        --protocol=anyconnect \
-        --user="$VPN_USER" \
-        --authgroup="$VPN_GROUP" \
-        ${VPN_NO_DTLS:+--no-dtls} \
-        --force-dpd="${VPN_DPD_TIMEOUT:-30}" \
-        --reconnect-timeout="${VPN_RECONNECT_TIMEOUT:-600}" \
-        "$VPN_HOST"
+
+    # 保存终端状态：openconnect 交互输入会修改 tty（关闭 onlcr），
+    # 异常退出时不会恢复，导致阶梯输出
+    local saved_tty
+    saved_tty=$(stty -g 2>/dev/null)
+    trap 'stty "$saved_tty" 2>/dev/null' EXIT
+
+    if [[ "${VPN_NO_DTLS:-}" == "true" ]]; then
+        sudo openconnect \
+            --protocol=anyconnect \
+            --user="$VPN_USER" \
+            --authgroup="$VPN_GROUP" \
+            --no-dtls \
+            --force-dpd="$VPN_DPD_TIMEOUT" \
+            --reconnect-timeout="$VPN_RECONNECT_TIMEOUT" \
+            "$VPN_HOST"
+    else
+        sudo openconnect \
+            --protocol=anyconnect \
+            --user="$VPN_USER" \
+            --authgroup="$VPN_GROUP" \
+            --force-dpd="$VPN_DPD_TIMEOUT" \
+            --reconnect-timeout="$VPN_RECONNECT_TIMEOUT" \
+            "$VPN_HOST"
+    fi
 }
 
 # 主逻辑
