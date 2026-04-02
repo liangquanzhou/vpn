@@ -163,7 +163,7 @@ vpn_disconnect() {
     cleanup_routes
 }
 
-# 连接 VPN（手动输入密码）
+# 连接 VPN（分步认证：sudo → 邮箱密码 → D盾验证码）
 vpn_connect() {
     if pgrep -x openconnect > /dev/null; then
         log_warn "VPN 已经在运行"
@@ -176,37 +176,138 @@ vpn_connect() {
         return 1
     fi
 
-    # 自动检测并修复 DNS
-    ensure_dns || return 1
+    if ! command -v expect >/dev/null 2>&1; then
+        log_error "未找到 expect，请先安装：brew install expect"
+        return 1
+    fi
 
+    # DNS 检查 + 路由清理
+    ensure_dns || return 1
     cleanup_routes
 
-    log_info "连接 VPN..."
+    log_info "VPN 连接 (用户: $VPN_USER)"
 
-    # 保存终端状态：openconnect 交互输入会修改 tty（关闭 onlcr），
-    # 异常退出时不会恢复，导致阶梯输出
-    local saved_tty
-    saved_tty=$(stty -g 2>/dev/null)
-    trap 'stty "$saved_tty" 2>/dev/null' EXIT
+    # ── Step 1/3: 电脑密码 ──
+    log_info "── Step 1/3: 电脑密码 ──"
+    sudo -v || { log_error "sudo 认证失败"; return 1; }
+    log_info "Step 1 通过"
 
-    if [[ "${VPN_NO_DTLS:-}" == "true" ]]; then
-        sudo openconnect \
-            --protocol=anyconnect \
-            --user="$VPN_USER" \
-            --authgroup="$VPN_GROUP" \
-            --no-dtls \
-            --force-dpd="$VPN_DPD_TIMEOUT" \
-            --reconnect-timeout="$VPN_RECONNECT_TIMEOUT" \
-            "$VPN_HOST"
+    # ── Step 2/3: 邮箱密码（expect 提交后等 challenge 表单确认成功）──
+    local pass
+    log_info "── Step 2/3: 邮箱密码 ──"
+    echo -n "邮箱密码: "
+    read -s pass; echo
+
+    # Step 3 将在 Step 2 成功后由 expect 提示（确保 D盾推送已发出）
+
+    # 预解析实际 dvpn 服务器（ezvpn 负载均衡器不支持 XML POST，会导致 openconnect 降级）
+    log_info "解析 VPN 服务器..."
+    local actual_host
+    actual_host=$(/usr/bin/curl -sSk --noproxy '*' \
+        -H "X-Transcend-Version: 1" \
+        -H "User-Agent: AnyConnect Darwin_arm64 4.10.08025" \
+        -D - -o /dev/null "https://$VPN_HOST/" 2>/dev/null \
+        | grep -i '^Location:' | tr -d '\r' | awk '{print $2}' | sed 's|^https://||;s|/$||')
+
+    if [[ -z "$actual_host" ]]; then
+        log_warn "无法解析 dvpn 服务器，使用原始地址"
+        actual_host="$VPN_HOST"
     else
-        sudo openconnect \
-            --protocol=anyconnect \
-            --user="$VPN_USER" \
-            --authgroup="$VPN_GROUP" \
-            --force-dpd="$VPN_DPD_TIMEOUT" \
-            --reconnect-timeout="$VPN_RECONNECT_TIMEOUT" \
-            "$VPN_HOST"
+        log_info "实际服务器: $actual_host"
     fi
+
+    sudo env \
+        "_VP=$pass" \
+        "_VH=$actual_host" \
+        "_VU=$VPN_USER" \
+        "_VG=$VPN_GROUP" \
+        "_VD=${VPN_DPD_TIMEOUT:-30}" \
+        "_VND=${VPN_NO_DTLS:-false}" \
+    /usr/bin/expect -c '
+set timeout 60
+
+set oc_args [list /opt/homebrew/bin/openconnect \
+    --useragent=AnyConnect\ Darwin_arm64\ 5.1.11388 \
+    --form-entry=main:username=$env(_VU) \
+    --form-entry=main:password=$env(_VP) \
+    --authgroup=$env(_VG) \
+    --force-dpd=$env(_VD) \
+    --background]
+
+if {$env(_VND) eq "true"} {
+    lappend oc_args --no-dtls
+}
+lappend oc_args "https://$env(_VH)/"
+
+log_user 0
+spawn {*}$oc_args
+log_user 1
+log_file -noappend /tmp/vpn_debug.log
+
+set fail_count 0
+expect {
+    -re "Response:|challenge_code:" {
+        # Step 2 成功（邮箱密码通过，XML 模式 prompt 是 "Response:"）
+        puts "\r\n\033\[0;32m\[INFO\]\033\[0m Step 2 通过"
+        puts "\033\[0;32m\[INFO\]\033\[0m ── Step 3/3: D盾验证码 ──"
+        puts "\033\[0;32m\[INFO\]\033\[0m 请现在打开 D-Chat → 工作台 → D盾，查看6位验证码"
+        puts -nonewline "验证码: "
+        flush stdout
+        interact -nobuffer -re "\r" return
+        # 等待隧道建立（eof = fork 到后台）或认证失败
+        expect {
+            eof {
+                puts "\r\n\033\[0;32m\[INFO\]\033\[0m Step 3 通过"
+                exit 0
+            }
+            -ex "Login failed" {
+                puts "\r\n\033\[0;31m\[ERROR\]\033\[0m D盾验证码错误或已过期"
+                exit 1
+            }
+            timeout {
+                puts "\r\n\033\[0;31m\[ERROR\]\033\[0m 隧道建立超时"
+                exit 1
+            }
+        }
+    }
+    -ex "Login failed" {
+        incr fail_count
+        if {$fail_count >= 3} {
+            puts "\r\n\033\[0;31m\[ERROR\]\033\[0m 邮箱密码错误（连续失败 $fail_count 次）"
+            exit 2
+        }
+        exp_continue
+    }
+    timeout {
+        puts "\r\n\033\[0;31m\[ERROR\]\033\[0m 连接超时"
+        exit 1
+    }
+}
+'
+
+    local ec=$?
+    unset pass
+
+    case $ec in
+        0)
+            sleep 2
+            if pgrep -x openconnect > /dev/null; then
+                log_info "VPN 已连接（后台运行）"
+                vpn_status
+            else
+                log_warn "openconnect 进程未检测到"
+                return 1
+            fi
+            ;;
+        2)
+            log_error "请确认密码是否正确、账号是否被锁定"
+            return 1
+            ;;
+        *)
+            log_error "连接失败（详见 /tmp/vpn_debug.log）"
+            return 1
+            ;;
+    esac
 }
 
 # 主逻辑
