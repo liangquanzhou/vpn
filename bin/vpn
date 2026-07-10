@@ -208,12 +208,18 @@ vpn_connect() {
 
     log_info "D盾验证码提示 → 输入后回车（Ctrl+C 断开）"
 
+    # 密码经 600 权限临时 config 传递（放 argv 里 ps 对所有用户可见）
+    local oc_config
+    oc_config=$(mktemp) && chmod 600 "$oc_config" || { log_error "创建临时配置失败"; return 1; }
+    trap 'rm -f "$oc_config"' RETURN
+    printf 'form-entry=main:password=%s\n' "$pass" > "$oc_config"
+
     # 构建 openconnect 参数
     local oc_args=(
         /opt/homebrew/bin/openconnect
         "--useragent=AnyConnect Darwin_arm64 5.1.11388"
         "--form-entry=main:username=$VPN_USER"
-        "--form-entry=main:password=$pass"
+        "--config=$oc_config"
         "--authgroup=$VPN_GROUP"
         "--force-dpd=${VPN_DPD_TIMEOUT:-30}"
     )
@@ -224,6 +230,7 @@ vpn_connect() {
     sudo "${oc_args[@]}"
     local ec=$?
     unset pass
+    rm -f "$oc_config"
 
     # 退出后清理路由
     cleanup_routes
